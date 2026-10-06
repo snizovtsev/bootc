@@ -96,6 +96,17 @@ this way for example.
 An optional integration that package managers can do is to detect this transient overlay
 situation and inform the user that the changes will be ephemeral.
 
+On images where `/opt` is a real directory rather than a symlink into `/var`,
+the same overlay also covers `/opt`, so packages that install there (such as
+Arch's `cuda`) share the lifetime of the rest of the install.
+
+With `bootc usroverlay --persist`, the overlay instead survives reboots for as
+long as the current deployment stays booted; a subsequent `bootc upgrade` or
+`bootc switch` boots the new image pristine, and the old overlay is garbage
+collected with its deployment. This gives local package changes a bounded place
+to accumulate where they can be inspected before being folded into the
+container image.
+
 ## Persistent changes
 
 A bootc system by default *does* have a writable, persistent data store that holds

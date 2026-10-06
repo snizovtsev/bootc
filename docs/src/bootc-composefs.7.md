@@ -97,6 +97,9 @@ collection. Upgrades of UKI installs from other releases are not yet tested.
 The following are supported with the composefs backend:
 
 - `bootc install`, `upgrade`, `switch`, `rollback`, `status`, `usr-overlay`
+  (including `--persist`, whose state lives in the deployment's state
+  directory under `usr/` and `opt/`; the `[usr]` and `[opt]` sections of
+  `setup-root-conf.toml` can make every deployment boot with such overlays)
   and soft reboots.
 - [`bootc install mount`](man/bootc-install-mount.8.md), for changing an
   installed deployment before its first boot.

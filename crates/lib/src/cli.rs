@@ -60,9 +60,9 @@ use crate::deploy::{MergeState, RequiredHostSpec};
 use crate::install::UkiAddonOpts;
 use crate::podstorage::set_additional_image_store;
 use crate::progress_jsonl::{ProgressWriter, RawProgressFd};
-use crate::spec::FilesystemOverlayAccessMode;
 use crate::spec::Host;
 use crate::spec::ImageReference;
+use crate::spec::{FilesystemOverlayAccessMode, FilesystemOverlayPersistence};
 use crate::status::get_host;
 use crate::store::{BootedOstree, Storage};
 use crate::store::{BootedStorage, BootedStorageKind};
@@ -341,7 +341,7 @@ pub(crate) struct StatusOpts {
     pub(crate) verbose: bool,
 }
 
-/// Add a transient overlayfs on /usr
+/// Add a writable overlayfs on /usr (and /opt when it is part of the image)
 #[derive(Debug, Parser, PartialEq, Eq)]
 pub(crate) struct UsrOverlayOpts {
     /// Mount the overlayfs as read-only. A read-only overlayfs is useful since it may be remounted
@@ -349,6 +349,15 @@ pub(crate) struct UsrOverlayOpts {
     /// read-only to the rest of the system.
     #[clap(long)]
     pub(crate) read_only: bool,
+
+    /// Keep the overlay across reboots of the current deployment.
+    ///
+    /// The upper directories are stored in the deployment's state directory, so changes survive
+    /// reboots but are discarded once a different deployment is booted (for example after
+    /// `bootc upgrade`) and are removed together with the deployment. On ostree-based systems
+    /// this is `ostree admin unlock --hotfix`, which cannot be combined with `--read-only`.
+    #[clap(long)]
+    pub(crate) persist: bool,
 }
 
 #[derive(Debug, clap::Subcommand, PartialEq, Eq)]
@@ -1174,9 +1183,11 @@ pub(crate) enum Opt {
     ///
     /// Shows bootc system state. Outputs YAML by default, human-readable if terminal detected.
     Status(StatusOpts),
-    /// Add a transient overlayfs on `/usr`.
+    /// Add a writable overlayfs on `/usr`, and on `/opt` when it is a directory of the image.
     ///
-    /// Allows temporary package installation that will be discarded on reboot.
+    /// By default the overlay is transient: it allows temporary package installation that will
+    /// be discarded on reboot. With `--persist`, changes are kept for as long as the current
+    /// deployment is the booted one.
     #[clap(alias = "usroverlay")]
     UsrOverlay(UsrOverlayOpts),
     /// Install the running container to a target.
@@ -2011,7 +2022,10 @@ async fn edit(opts: EditOpts) -> Result<()> {
 }
 
 /// Implementation of `bootc usroverlay`
-async fn usroverlay(access_mode: FilesystemOverlayAccessMode) -> Result<()> {
+async fn usroverlay(
+    access_mode: FilesystemOverlayAccessMode,
+    persistence: FilesystemOverlayPersistence,
+) -> Result<()> {
     let status = get_usr_overlay_status()?;
     if status.is_some() {
         println!("An overlayfs is already mounted on /usr");
@@ -2020,11 +2034,17 @@ async fn usroverlay(access_mode: FilesystemOverlayAccessMode) -> Result<()> {
 
     // This is just a pass-through today.  At some point we may make this a libostree API
     // or even oxidize it.
-    let args = match access_mode {
+    use FilesystemOverlayAccessMode::*;
+    use FilesystemOverlayPersistence::*;
+    let args: &[&str] = match (access_mode, persistence) {
         // In this context, "--transient" means "read-only overlay"
-        FilesystemOverlayAccessMode::ReadOnly => ["admin", "unlock", "--transient"].as_slice(),
-
-        FilesystemOverlayAccessMode::ReadWrite => ["admin", "unlock"].as_slice(),
+        (ReadOnly, Transient) => &["admin", "unlock", "--transient"],
+        (ReadWrite, Transient) => &["admin", "unlock"],
+        // A hotfix is ostree's persistent, deployment-scoped /usr overlay
+        (ReadWrite, Persistent) => &["admin", "unlock", "--hotfix"],
+        (ReadOnly, Persistent) => {
+            anyhow::bail!("--read-only and --persist cannot be combined on ostree systems")
+        }
     };
     Err(Command::new("ostree").args(args).exec().into())
 }
@@ -2283,9 +2303,16 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
             } else {
                 FilesystemOverlayAccessMode::ReadWrite
             };
+            let persistence = if opts.persist {
+                FilesystemOverlayPersistence::Persistent
+            } else {
+                FilesystemOverlayPersistence::Transient
+            };
             match env {
-                Environment::OstreeBooted => usroverlay(access_mode).await,
-                Environment::ComposefsBooted(_) => composefs_usr_overlay(access_mode),
+                Environment::OstreeBooted => usroverlay(access_mode, persistence).await,
+                Environment::ComposefsBooted(cmdline) => {
+                    composefs_usr_overlay(access_mode, persistence, &cmdline)
+                }
                 _ => anyhow::bail!("usroverlay only applies on booted hosts"),
             }
         }

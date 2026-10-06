@@ -4,10 +4,13 @@ use std::path::Path;
 use std::{fs::create_dir_all, process::Command};
 
 use anyhow::{Context, Result};
-use bootc_initramfs_setup::{mount_at_wrapper, overlay_transient};
+use bootc_initramfs_setup::{
+    IMAGE_OVERLAY_DIRS, OVERLAY_SOURCE_PERSISTENT, OVERLAY_SOURCE_TRANSIENT, mount_at_wrapper,
+    overlay_persistent, overlay_transient, set_mount_readwrite,
+};
 use bootc_mount::tempmount::TempMount;
 use bootc_utils::CommandRunExt;
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use canon_json::CanonJsonSerialize;
 use cap_std_ext::cap_std::ambient_authority;
 use cap_std_ext::cap_std::fs::{Dir, Permissions, PermissionsExt};
@@ -19,9 +22,10 @@ use linux_kernel_cmdline::utf8::Cmdline;
 
 use ostree_ext::container::deploy::ORIGIN_CONTAINER;
 use rustix::{
-    fd::AsFd,
-    fs::{Mode, OFlags, StatVfsMountFlags, open},
-    mount::MountAttrFlags,
+    fd::{AsFd, OwnedFd},
+    fs::{CWD, Mode, OFlags, StatVfsMountFlags, mkdirat, open},
+    io::Errno,
+    mount::{MountAttrFlags, OpenTreeFlags, open_tree},
     path::Arg,
 };
 
@@ -344,25 +348,129 @@ pub(crate) fn remove_staged_deployment() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn composefs_usr_overlay(access_mode: FilesystemOverlayAccessMode) -> Result<()> {
-    let status = get_usr_overlay_status()?;
-    if status.is_some() {
-        println!("An overlayfs is already mounted on /usr");
+/// A deployment state directory opened through a private, writable clone of
+/// the `/sysroot` mount.
+///
+/// The detached clone exists only as long as the `open_tree` fd that created
+/// it is open; once that fd is closed the kernel dissolves the tree and
+/// overlayfs refuses to use directories on it as layers.  Keep this value
+/// alive until the overlay has been created.
+struct WritableStateDir {
+    _mount: OwnedFd,
+    dir: Dir,
+}
+
+/// Open the booted deployment's state directory for writing.
+///
+/// `/sysroot` is mounted read-only on a running system.  Rather than remounting
+/// it writable, which every process would observe, clone the mount detached,
+/// clear the read-only attribute on the clone alone and resolve the state
+/// directory through it.  An overlay whose upper directory is opened this way
+/// keeps its own reference to the writable clone.
+#[context("Opening state directory of deployment {deployment_id} for writing")]
+fn open_writable_state_dir(deployment_id: &str) -> Result<WritableStateDir> {
+    let mount = open_tree(
+        CWD,
+        "/sysroot",
+        OpenTreeFlags::OPEN_TREE_CLONE | OpenTreeFlags::OPEN_TREE_CLOEXEC,
+    )
+    .context("Cloning /sysroot mount")?;
+    set_mount_readwrite(&mount)?;
+    let sysroot = Dir::reopen_dir(&mount).context("Reopening /sysroot clone")?;
+    let path = Path::new(STATE_DIR_RELATIVE).join(deployment_id);
+    let dir = sysroot
+        .open_dir(&path)
+        .with_context(|| format!("Opening {}", path.display()))?;
+    Ok(WritableStateDir { _mount: mount, dir })
+}
+
+pub(crate) fn composefs_usr_overlay(
+    access_mode: FilesystemOverlayAccessMode,
+    persistence: FilesystemOverlayPersistence,
+    cmdline: &ComposefsCmdline,
+) -> Result<()> {
+    if let Some(status) = get_usr_overlay_status()? {
+        println!("A {status} overlayfs is already mounted on /usr");
         return Ok(());
     }
-
-    let usr = Dir::open_ambient_dir("/usr", ambient_authority()).context("Opening /usr")?;
 
     let mount_attr_flags = match access_mode {
         FilesystemOverlayAccessMode::ReadOnly => Some(MountAttrFlags::MOUNT_ATTR_RDONLY),
         FilesystemOverlayAccessMode::ReadWrite => None,
     };
 
-    let overlay_fd = overlay_transient(usr.as_fd(), "transient", mount_attr_flags)?;
-    mount_at_wrapper(overlay_fd, &usr, ".").context("Attaching /usr overlay")?;
+    // Persistent upper directories live in the booted deployment's state
+    // directory, so they are discarded (and eventually garbage collected)
+    // along with the deployment.  bootc-root-setup mounts them again on every
+    // boot of this deployment.  Open it once; it must outlive the overlays'
+    // creation (see `WritableStateDir`).
+    let state = match persistence {
+        FilesystemOverlayPersistence::Transient => None,
+        FilesystemOverlayPersistence::Persistent => Some(open_writable_state_dir(&cmdline.digest)?),
+    };
 
-    println!("A {} overlayfs is now mounted on /usr", access_mode);
-    println!("All changes there will be discarded on reboot.");
+    let mut mounted = Vec::new();
+    for name in IMAGE_OVERLAY_DIRS {
+        let path = Utf8Path::new("/").join(name);
+        // Only real directories of the image take part; /opt for instance is
+        // often a symlink into /var, where it is already writable.
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("Checking {path}")),
+        }
+        let dir = Dir::open_ambient_dir(&path, ambient_authority())
+            .with_context(|| format!("Opening {path}"))?;
+        if dir.is_mountpoint(".")?.unwrap_or(false) {
+            println!("Skipping {path}: already a mountpoint");
+            continue;
+        }
+
+        let overlay_fd = match &state {
+            None => overlay_transient(dir.as_fd(), OVERLAY_SOURCE_TRANSIENT, mount_attr_flags)?,
+            Some(state) => {
+                match mkdirat(state.dir.as_fd(), *name, Mode::from(0o755)) {
+                    Ok(()) | Err(Errno::EXIST) => {}
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!("Creating persistent {path} state directory")
+                        });
+                    }
+                }
+                let dir_state = state
+                    .dir
+                    .open_dir(name)
+                    .with_context(|| format!("Opening persistent {path} state directory"))?;
+                overlay_persistent(
+                    dir.as_fd(),
+                    dir_state.as_fd(),
+                    OVERLAY_SOURCE_PERSISTENT,
+                    mount_attr_flags,
+                )?
+            }
+        };
+        mount_at_wrapper(overlay_fd, &dir, ".")
+            .with_context(|| format!("Attaching {path} overlay"))?;
+        mounted.push(path);
+    }
+
+    let mounted = mounted
+        .iter()
+        .map(|p| p.as_str())
+        .collect::<Vec<_>>()
+        .join(" and ");
+    println!("A {access_mode} {persistence} overlayfs is now mounted on {mounted}");
+    match persistence {
+        FilesystemOverlayPersistence::Transient => {
+            println!("All changes there will be discarded on reboot.");
+        }
+        FilesystemOverlayPersistence::Persistent => {
+            println!(
+                "Changes there persist across reboots of this deployment and are discarded once another deployment is booted."
+            );
+        }
+    }
 
     Ok(())
 }
@@ -382,10 +490,21 @@ pub(crate) fn get_usr_overlay_status() -> Result<Option<FilesystemOverlay>> {
         } else {
             FilesystemOverlayAccessMode::ReadWrite
         };
-        // For the composefs backend, assume the /usr overlay is always transient.
+        // bootc mounts both kinds of /usr overlay with a distinguishing
+        // `source`; anything else found on /usr is reported as transient.
+        let persistence = match bootc_mount::inspect_filesystem(Utf8Path::new("/usr")) {
+            Ok(fs) if fs.source == OVERLAY_SOURCE_PERSISTENT => {
+                FilesystemOverlayPersistence::Persistent
+            }
+            Ok(_) => FilesystemOverlayPersistence::Transient,
+            Err(e) => {
+                tracing::debug!("Failed to inspect /usr mount: {e:#}");
+                FilesystemOverlayPersistence::Transient
+            }
+        };
         Ok(Some(FilesystemOverlay {
             access_mode: permissions,
-            persistence: FilesystemOverlayPersistence::Transient,
+            persistence,
         }))
     } else {
         Ok(None)

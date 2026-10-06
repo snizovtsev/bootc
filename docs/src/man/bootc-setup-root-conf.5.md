@@ -99,6 +99,39 @@ Note: unlike `/etc` and `/root`, using overlayfs (the `"transient"` mount type
 from earlier releases) for `/var` is not supported because it breaks podman and
 other tools that use overlayfs under `/var/lib/containers`.
 
+## `[usr]` and `[opt]`
+
+Control whether `/usr` and `/opt` are overlaid.  Both are part of the
+composefs image and read-only by default; an overlay makes them writable, for
+example for package managers (see `bootc-usr-overlay(8)`).  `/opt` only takes
+part when it is a real directory of the image; images that make it a symlink
+into `/var` keep it there, and configuring `[opt]` on such an image is an
+error.
+
+`mount` (string)
+  One of `"none"`, `"overlay"`, or `"transient"`.  When unset (the default), a
+  persistent overlay is mounted only if the deployment's state directory
+  already contains one, as created by `bootc usr-overlay --persist`.
+
+  - `none` (alias `"root"`) — the directory is never overlaid, even when
+    persistent overlay state exists for the deployment.
+  - `overlay` — the directory is an overlayfs whose upper directory lives in
+    the deployment state directory (`usr/` or `opt/`), created on first boot.
+    Writes persist across reboots of that deployment and are dropped once
+    another deployment is booted; garbage collection removes them with the
+    deployment.
+  - `transient` — the directory is a tmpfs overlay on every boot; writes are
+    discarded on reboot.  Equivalent to running `bootc usr-overlay` after each
+    boot.
+
+  `bind` is not valid for these directories.
+
+`transient` (boolean, default: `false`)
+  Shorthand for `mount = "transient"`.  Ignored when `mount` is also set.
+
+A writable `/usr` defeats the integrity guarantees of a sealed image; these
+sections are meant for development and for unsealed systems.
+
 # EXAMPLES
 
 Default (all persistent, equivalent to an absent file):
@@ -106,6 +139,16 @@ Default (all persistent, equivalent to an absent file):
 ```toml
 [etc]
 mount = "bind"
+```
+
+Persistent, writable `/usr` and `/opt` scoped to each deployment — package
+installs survive reboots, while every upgrade boots the pristine image:
+
+```toml
+[usr]
+mount = "overlay"
+[opt]
+mount = "overlay"
 ```
 
 Transient `/etc` — suitable for sealed or integrity-verified images where

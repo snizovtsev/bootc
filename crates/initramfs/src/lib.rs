@@ -11,7 +11,9 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use rustix::{
-    fs::{CWD, Mode, OFlags, major, minor, mkdirat, openat, stat, symlink},
+    fs::{
+        AtFlags, CWD, FileType, Mode, OFlags, major, minor, mkdirat, openat, stat, statat, symlink,
+    },
     io::Errno,
     mount::{
         FsMountFlags, MountAttrFlags, OpenTreeFlags, UnmountFlags, fsconfig_create,
@@ -79,6 +81,22 @@ pub fn set_mount_readonly(fd: impl AsFd) -> Result<()> {
     mount_setattr(fd, libc::AT_EMPTY_PATH, &attr)
 }
 
+/// Clear the read-only attribute on a detached mount tree.
+///
+/// Used to get a writable view of a filesystem whose regular mount is
+/// read-only (such as `/sysroot` on a booted system) without changing that
+/// mount for anyone else.  Fails if the filesystem itself is read-only.
+#[context("Setting mount writable")]
+pub fn set_mount_readwrite(fd: impl AsFd) -> Result<()> {
+    let attr = MountAttr {
+        attr_set: 0,
+        attr_clr: MOUNT_ATTR_RDONLY,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    mount_setattr(fd, libc::AT_EMPTY_PATH, &attr)
+}
+
 /// Set a mount and every mount below it read-only.
 #[context("Setting mount tree readonly")]
 pub fn set_mount_tree_readonly(fd: impl AsFd) -> Result<()> {
@@ -132,12 +150,31 @@ pub struct Config {
     /// How `/var` is mounted
     #[serde(default)]
     pub var: MountConfig,
+    /// Whether and how `/usr` is overlaid; see [`mount_image_dir`].
+    #[serde(default)]
+    pub usr: MountConfig,
+    /// Whether and how `/opt` is overlaid, when it is a directory of the image
+    /// rather than a symlink into `/var`; see [`mount_image_dir`].
+    #[serde(default)]
+    pub opt: MountConfig,
     #[serde(default)]
     root: RootConfig,
 }
 
 /// Default path to the setup-root configuration file, relative to the booted root.
 pub const SETUP_ROOT_CONF_PATH: &str = "/usr/lib/composefs/setup-root-conf.toml";
+
+/// Directories of the image that `bootc usr-overlay` and the `[usr]` / `[opt]`
+/// configuration can overlay.  Each has a same-named subdirectory in the
+/// deployment's state directory holding the upper and work directories of its
+/// persistent overlay.  `/opt` only takes part when it is a real directory of
+/// the image; images that make it a symlink into `/var` keep it there.
+pub const IMAGE_OVERLAY_DIRS: &[&str] = &["usr", "opt"];
+/// Overlay `source` of a transient (tmpfs-backed) image directory overlay, as
+/// seen in `/proc/self/mountinfo`.
+pub const OVERLAY_SOURCE_TRANSIENT: &str = "transient";
+/// Overlay `source` of a persistent (state-backed) image directory overlay.
+pub const OVERLAY_SOURCE_PERSISTENT: &str = "persistent";
 
 /// Returns `true` if the configuration at `path` requests a transient `/etc`
 /// overlay.  Used by the systemd generator to decide whether to emit the
@@ -308,6 +345,23 @@ fn overlay_state(
 ) -> Result<()> {
     let fs = build_overlay_fd(&base, state, source, mount_attr_flags)?;
     mount_at_wrapper(fs, base, ".").context("Moving mount")
+}
+
+/// Creates a persistent overlayfs with the passed-in fd as the lowerdir and
+/// `state` as the directory holding its `upper` and `work` directories, which
+/// are created if missing.
+///
+/// Returns a detached (not yet attached) `OwnedFd` for the overlay mount.
+/// The overlay keeps its own reference to the mount `state` was opened
+/// through, so the caller may close `state` afterwards.
+#[context("Creating persistent overlayfs")]
+pub fn overlay_persistent(
+    base: impl AsFd,
+    state: impl AsFd,
+    source: &str,
+    mount_attr_flags: Option<MountAttrFlags>,
+) -> Result<OwnedFd> {
+    build_overlay_fd(base, state, source, mount_attr_flags)
 }
 
 /// Creates a transient overlayfs with the passed-in fd as the lowerdir.
@@ -492,6 +546,88 @@ pub fn mount_subdir(
     }
 }
 
+/// Returns whether `name` is a real directory (not a symlink) in `root`.
+fn is_image_dir(root: impl AsFd, name: &str) -> Result<bool> {
+    match statat(root.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => Ok(FileType::from_raw_mode(st.st_mode) == FileType::Directory),
+        Err(Errno::NOENT) => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("stat {name}")),
+    }
+}
+
+/// Mounts an overlay on the image directory `name` (one of
+/// [`IMAGE_OVERLAY_DIRS`]) according to its `[name]` configuration.
+///
+/// Unlike `/etc` and `/var`, these directories are served by the composefs
+/// image and need no mount of their own, so the default is to add one only
+/// when the deployment's state directory already has a same-named
+/// subdirectory, which `bootc usr-overlay --persist` creates.  The
+/// configuration can force a choice instead:
+///
+/// - `overlay`: always mount a persistent overlay, creating the state
+///   directory on first boot;
+/// - `transient`: mount a tmpfs-backed overlay on every boot;
+/// - `none`: never overlay the directory, even when persistent state exists.
+///
+/// A directory that is not part of the image (for instance `/opt` as a
+/// symlink into `/var`) is skipped by default and an error when configured.
+///
+/// A persistent overlay lives in the state directory of the booted
+/// deployment, so it is left behind when another deployment is booted and
+/// removed together with the deployment by garbage collection.
+#[context("Mounting /{name}")]
+pub fn mount_image_dir(
+    new_root: impl AsFd,
+    state: impl AsFd,
+    name: &str,
+    config: MountConfig,
+) -> Result<()> {
+    let configured = config.mount.is_some() || config.transient;
+    let mount_type = match config.mount {
+        Some(mt) => mt,
+        None if config.transient => MountType::Transient,
+        None => match openat(
+            state.as_fd(),
+            name,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(_) => MountType::Overlay,
+            Err(Errno::NOENT) => return Ok(()),
+            Err(err) => return Err(err).context("Checking for persistent overlay state"),
+        },
+    };
+    if mount_type == MountType::None {
+        return Ok(());
+    }
+    if !is_image_dir(&new_root, name)? {
+        if configured {
+            anyhow::bail!("/{name} is not a directory of the image and cannot be overlaid");
+        }
+        tracing::debug!("/{name} is not a directory of the image; not overlaying it");
+        return Ok(());
+    }
+
+    match mount_type {
+        MountType::None => Ok(()),
+        MountType::Bind => anyhow::bail!("[{name}] mount = \"bind\" is not supported"),
+        MountType::Overlay => {
+            let dir_state = ensure_dir(&state, name, Some(0o755.into()))?;
+            overlay_state(
+                open_dir(&new_root, name)?,
+                dir_state,
+                OVERLAY_SOURCE_PERSISTENT,
+                None,
+            )
+        }
+        MountType::Transient => {
+            let dir = open_dir(&new_root, name)?;
+            let overlay_fd = overlay_transient(dir.as_fd(), OVERLAY_SOURCE_TRANSIENT, None)?;
+            mount_at_wrapper(overlay_fd, &new_root, name)
+        }
+    }
+}
+
 #[context("GPT workaround")]
 /// Workaround for /dev/gpt-auto-root
 pub fn gpt_workaround() -> Result<()> {
@@ -655,6 +791,11 @@ pub fn setup_root(args: Args) -> Result<()> {
     // MountType::None, which skips the bind-mount entirely and leaves /var
     // as an empty directory from the composefs image for systemd to fill.
     mount_subdir(visible_root, &state, "var", config.var, MountType::Bind)?;
+    // /usr (and /opt, when it is part of the image) are served by the composefs
+    // image; only overlay them when configured or when a persistent overlay was
+    // previously set up for this deployment.
+    mount_image_dir(visible_root, &state, "usr", config.usr)?;
+    mount_image_dir(visible_root, &state, "opt", config.opt)?;
 
     if cfg!(not(feature = "pre-6.15")) {
         // Replace the /sysroot with the new composed root filesystem.
@@ -689,9 +830,41 @@ mod tests {
                     mount: None,
                     transient: false
                 },
+                usr: MountConfig {
+                    mount: None,
+                    transient: false
+                },
+                opt: MountConfig {
+                    mount: None,
+                    transient: false
+                },
                 root: RootConfig { transient: false },
             }
         );
+    }
+
+    #[test]
+    fn test_image_dir_config() {
+        // Unset: a persistent overlay is mounted only if its state exists.
+        let config = parse("");
+        assert_eq!(config.usr, MountConfig::default());
+        assert_eq!(config.opt, MountConfig::default());
+        let cases = [
+            ("overlay", Some(MountType::Overlay)),
+            ("transient", Some(MountType::Transient)),
+            ("none", Some(MountType::None)),
+        ];
+        for (value, expected) in cases {
+            let config = parse(&format!(
+                "[usr]\nmount = \"{value}\"\n[opt]\nmount = \"{value}\""
+            ));
+            assert_eq!(config.usr.mount, expected, "{value}");
+            assert_eq!(config.opt.mount, expected, "{value}");
+        }
+        let config = parse("[opt]\ntransient = true");
+        assert!(config.opt.transient);
+        assert_eq!(config.opt.mount, None);
+        assert_eq!(config.usr, MountConfig::default());
     }
 
     #[test]

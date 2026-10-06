@@ -1,7 +1,6 @@
 # NAME
 
-bootc-usr-overlay - Adds a transient overlayfs on `/usr` that will be discarded
-on reboot
+bootc-usr-overlay - Adds a writable overlayfs on `/usr`
 
 # SYNOPSIS
 
@@ -9,8 +8,10 @@ on reboot
 
 # DESCRIPTION
 
-Adds a transient overlayfs on `/usr` that will be discarded on reboot. The
-overlayfs is read/write by default.
+Adds a writable overlayfs on `/usr`, and on `/opt` when it is a directory of
+the image rather than a symlink into `/var`. By default the overlay is
+transient and discarded on reboot; with `--persist` it is kept for as long as
+the current deployment stays booted. The overlayfs is read/write by default.
 
 ## USE CASES
 
@@ -36,6 +37,23 @@ environments such as CI runners or small virtual machines.  If the
 combined size of the packages being installed approaches half of the
 system's RAM, consider increasing the VM's memory allocation instead.
 
+## PERSISTENT OVERLAYS
+
+With `--persist`, the upper directories of the overlays are stored on disk in
+the state directory of the booted deployment instead of a `tmpfs`, and
+`bootc-root-setup` mounts them again on every boot of that deployment. Changes
+therefore survive reboots, but `bootc upgrade` or `bootc switch` boot the new
+deployment with a pristine `/usr`. The previous overlay stays on disk, where it
+can be inspected (for example to fold local package installs back into the
+container image), until garbage collection removes the old deployment.
+
+On ostree-based hosts this is `ostree admin unlock --hotfix`. On composefs
+hosts the same behaviour can be configured for every deployment with
+`[usr] mount = "overlay"` (and `[opt]`) in `setup-root-conf.toml`; see
+`bootc-setup-root-conf(5)`.
+
+A writable `/usr` defeats the integrity guarantees of a sealed image.
+
 ## /ETC AND /VAR
 
 However, this command has no effect on `/etc` and `/var` - changes
@@ -54,6 +72,10 @@ unmount".
 **--read-only**
 
     Mount the overlayfs as read-only. A read-only overlayfs is useful since it may be remounted as read/write in a private mount namespace and written to while the mount point remains read-only to the rest of the system
+
+**--persist**
+
+    Keep the overlay across reboots of the current deployment
 
 <!-- END GENERATED OPTIONS -->
 
