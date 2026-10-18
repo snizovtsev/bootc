@@ -680,6 +680,14 @@ pub(crate) async fn image_exists_in_unified_storage(
     store: &Storage,
     imgref: &ImageReference,
 ) -> Result<bool> {
+    // The bootc-owned containers-storage is driven through podman. Without
+    // it nothing can have been pulled into unified storage, so answer "no"
+    // instead of failing a plain switch or upgrade on an image that ships
+    // no podman at all.
+    if !crate::utils::have_executable(bootc_utils::podman_bin())? {
+        tracing::debug!("No podman; assuming image is not in unified storage");
+        return Ok(false);
+    }
     let imgstore = store.get_ensure_imgstore()?;
     let image_ref_str = imgref.to_transport_image()?;
     imgstore.exists(&image_ref_str).await
