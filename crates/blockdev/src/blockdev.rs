@@ -585,7 +585,7 @@ pub fn list_dev_by_dir(dir: &Dir) -> Result<Device> {
 }
 
 /// The statfs magic of ZFS (`ZFS_SUPER_MAGIC` in OpenZFS), which libc lacks.
-const ZFS_SUPER_MAGIC: u32 = 0x2fc12fc1;
+pub const ZFS_SUPER_MAGIC: u32 = 0x2fc12fc1;
 
 /// Whether a filesystem with the given `st_dev` and statfs magic is backed by
 /// a block device.
