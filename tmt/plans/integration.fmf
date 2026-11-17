@@ -437,4 +437,13 @@ execute:
       - /tmt/tests/tests/test-68-install-bcachefs-multi-device
   extra-skip_if_ostree: true
   extra-fixme_skip_if_uki: true
+
+/plan-69-install-zfs:
+  summary: Test install to-filesystem on a ZFS root
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-69-install-zfs
+  extra-skip_if_ostree: true
+  extra-fixme_skip_if_uki: true
 # END GENERATED PLANS
