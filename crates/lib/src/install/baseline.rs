@@ -171,8 +171,8 @@ fn mkfs<'a>(
             t.cmd.arg("-U");
             t.cmd.arg(u.to_string());
         }
-        // install_create_rootfs() rejects bcachefs before any device is touched.
-        Filesystem::Bcachefs => anyhow::bail!("mkfs.bcachefs is not supported"),
+        // install_create_rootfs() rejects these before any device is touched.
+        Filesystem::Bcachefs | Filesystem::Zfs => anyhow::bail!("mkfs.{fs} is not supported"),
     };
     // Today all the above mkfs commands take -L
     t.cmd.args(["-L", label]);
@@ -897,10 +897,11 @@ pub(crate) fn install_create_rootfs(
         .and_then(|c| c.filesystem_root())
         .and_then(|r| r.fstype));
     // GRUB cannot read bcachefs, so no /boot we could create would be
-    // bootable, and systemd-repart cannot format it.
-    if root_fs == Some(Filesystem::Bcachefs) {
+    // bootable, and systemd-repart cannot format it. A ZFS root is a
+    // dataset in a pool, which no mkfs or systemd-repart creates.
+    if let Some(fs @ (Filesystem::Bcachefs | Filesystem::Zfs)) = root_fs {
         anyhow::bail!(
-            "bcachefs is not supported by `install to-disk`; \
+            "{fs} is not supported by `install to-disk`; \
              create the filesystem by hand and use `install to-filesystem`"
         );
     }
