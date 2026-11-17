@@ -1606,12 +1606,15 @@ pub(crate) fn finalize_filesystem(
         .args(["-o", "remount,ro", path.as_str()])
         .run()?;
     // Finally, freezing (and thawing) the filesystem will flush the journal, which means the next boot is clean.
-    // VFAT has no journal and does not support fsfreeze. Might need to be expanded in the future
+    // VFAT has no journal and does not support fsfreeze. ZFS has no freeze operation either;
+    // the read-only remount above already synced it. Might need to be expanded in the future
     // to also *not* fsfreeze other filesystems.
     let fsdir = root.open_dir(path.as_str())?;
     let st = rustix::fs::fstatfs(fsdir.as_fd())?;
     if st.f_type == libc::MSDOS_SUPER_MAGIC {
         tracing::debug!("Filesystem {fsname} is VFAT, skipping fsfreeze");
+    } else if st.f_type as u32 == bootc_blockdev::ZFS_SUPER_MAGIC {
+        tracing::debug!("Filesystem {fsname} is ZFS, skipping fsfreeze");
     } else {
         for a in ["-f", "-u"] {
             Command::new("fsfreeze")
