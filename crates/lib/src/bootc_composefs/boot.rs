@@ -2700,12 +2700,12 @@ fn install_composefs_bootloader(
     if bootloader == Bootloader::Ukiboot {
         return mounted_root.with_esp(|esp| install_ukiboot(mounted_root.dir(), fs, repo, esp));
     }
-    let boot_uuid = root_setup
-        .get_boot_uuid()?
-        .or(root_setup.rootfs_uuid.as_deref())
-        .ok_or_else(|| anyhow!("No uuid for boot/root"))?;
 
     if cfg!(target_arch = "s390x") {
+        let boot_uuid = root_setup
+            .get_boot_uuid()?
+            .or(root_setup.rootfs_uuid.as_deref())
+            .ok_or_else(|| anyhow!("No uuid for boot/root"))?;
         // TODO: Integrate s390x support into install_via_bootupd
         crate::bootloader::install_via_zipl(
             &root_setup.device_info.require_single_root()?,
