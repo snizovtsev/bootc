@@ -428,4 +428,13 @@ execute:
     test:
       - /tmt/tests/tests/test-63-install-shared-propagation
   extra-fixme_skip_if_composefs: true
+
+/plan-68-install-bcachefs-multi-device:
+  summary: Test install to-filesystem on a multi-device bcachefs root
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-68-install-bcachefs-multi-device
+  extra-skip_if_ostree: true
+  extra-fixme_skip_if_uki: true
 # END GENERATED PLANS
