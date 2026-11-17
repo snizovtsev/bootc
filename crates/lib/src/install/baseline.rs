@@ -175,8 +175,8 @@ fn mkfs<'a>(
             t.cmd.arg("-U");
             t.cmd.arg(u.to_string());
         }
-        // install_create_rootfs() rejects bcachefs before any device is touched.
-        Filesystem::Bcachefs => anyhow::bail!("mkfs.bcachefs is not supported"),
+        // install_create_rootfs() rejects these before any device is touched.
+        Filesystem::Bcachefs | Filesystem::Zfs => anyhow::bail!("mkfs.{fs} is not supported"),
     };
     // Today all the above mkfs commands take -L
     t.cmd.args(["-L", label]);
@@ -993,11 +993,11 @@ pub(crate) fn install_create_rootfs(
     let root_fs = opts.filesystem.or(install_config
         .and_then(|c| c.filesystem_root())
         .and_then(|r| r.fstype));
-    // Automatic storage setup for bcachefs is not implemented.
-    // Reject it before modifying the target disk.
-    if root_fs == Some(Filesystem::Bcachefs) {
+    // Automatic storage setup for bcachefs and ZFS is not implemented.
+    // Reject them before modifying the target disk.
+    if let Some(fs @ (Filesystem::Bcachefs | Filesystem::Zfs)) = root_fs {
         anyhow::bail!(
-            "bcachefs is not supported by `install to-disk`; \
+            "{fs} is not supported by `install to-disk`; \
              create the filesystem by hand and use `install to-filesystem`"
         );
     }

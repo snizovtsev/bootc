@@ -2927,6 +2927,13 @@ pub(crate) async fn install_to_filesystem(
         // In the to-existing-root case, look at /proc/cmdline
         let cmdline = bytes::Cmdline::from_proc()?;
         find_root_args_to_inherit(&cmdline, &inspect)?
+    } else if inspect.fstype == "zfs" {
+        // A dataset has no UUID; the initramfs imports the pool and mounts
+        // the dataset by name.
+        RootMountInfo {
+            mount_spec: format!("ZFS={}", inspect.source),
+            kargs: Vec::new(),
+        }
     } else {
         // Otherwise, gather metadata from the provided root and use its provided UUID as a
         // default root= karg.

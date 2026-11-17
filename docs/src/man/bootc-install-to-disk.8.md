@@ -101,6 +101,7 @@ set `discoverable-partitions = true` in their install configuration
     - ext4
     - btrfs
     - bcachefs
+    - zfs
 
 **--root-size**=*ROOT_SIZE*
 
