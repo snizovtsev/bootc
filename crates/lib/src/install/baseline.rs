@@ -175,6 +175,8 @@ fn mkfs<'a>(
             t.cmd.arg("-U");
             t.cmd.arg(u.to_string());
         }
+        // install_create_rootfs() rejects ZFS before any device is touched.
+        Filesystem::Zfs => anyhow::bail!("mkfs.zfs is not supported"),
     };
     // Today all the above mkfs commands take -L
     t.cmd.args(["-L", label]);
@@ -991,6 +993,14 @@ pub(crate) fn install_create_rootfs(
     let root_fs = opts.filesystem.or(install_config
         .and_then(|c| c.filesystem_root())
         .and_then(|r| r.fstype));
+    // A ZFS root is a dataset in a pool, which no mkfs creates. Reject it
+    // before modifying the target disk.
+    if root_fs == Some(Filesystem::Zfs) {
+        anyhow::bail!(
+            "zfs is not supported by `install to-disk`; \
+             create the filesystem by hand and use `install to-filesystem`"
+        );
+    }
     let luks_name = "root";
     // Verify that the target is empty (if not already wiped in particular, but it's
     // also good to verify that the wipe worked)

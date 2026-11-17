@@ -25,6 +25,7 @@ pub(crate) enum Filesystem {
     Ext4,
     Btrfs,
     Bcachefs,
+    Zfs,
 }
 
 impl std::fmt::Display for Filesystem {
@@ -42,6 +43,7 @@ impl TryFrom<&str> for Filesystem {
             "ext4" => Ok(Self::Ext4),
             "btrfs" => Ok(Self::Btrfs),
             "bcachefs" => Ok(Self::Bcachefs),
+            "zfs" => Ok(Self::Zfs),
             other => anyhow::bail!("Unknown filesystem: {}", other),
         }
     }
