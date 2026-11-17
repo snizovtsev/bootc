@@ -308,3 +308,10 @@ check:
   require:
   - dosfstools
   test: nu booted/test-install-bcachefs-multi-device.nu
+
+/test-69-install-zfs:
+  summary: Test install to-filesystem on a ZFS root
+  duration: 30m
+  require:
+  - dosfstools
+  test: nu booted/test-install-zfs.nu
