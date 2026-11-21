@@ -2461,12 +2461,20 @@ pub(crate) async fn install_to_disk(mut opts: InstallToDiskOpts) -> Result<()> {
         anyhow::bail!("Not a block device: {}", block_opts.device);
     }
 
+    // With --run-repart, the root filesystem is that of the image's root
+    // definition, if it has one. The fs-verity policy depends on it.
+    let target_fs = if opts.run_repart {
+        baseline::run_repart_root_filesystem(&block_opts.device, block_opts.filesystem)?
+    } else {
+        block_opts.filesystem
+    };
+
     let state = prepare_install(
         opts.config_opts,
         opts.source_opts,
         opts.target_opts,
         opts.composefs_opts,
-        block_opts.filesystem,
+        target_fs,
         true,
     )
     .await?;

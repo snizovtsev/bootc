@@ -12,7 +12,7 @@ use std::fmt::Display;
 use std::fmt::Write as _;
 use std::io::Write;
 use std::num::NonZeroU64;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 
@@ -423,7 +423,7 @@ fn systemd_repart(
     // Dry-run to check what partitions would be created
     // Send `generic_image` as false so that we can see ALL defined
     // partitions
-    let dry_partitions = systemd_repart_run(device, false, true, RepartDefinitions::Image)?;
+    let dry_partitions = systemd_repart_run(&device.path(), false, true, RepartDefinitions::Image)?;
 
     if dry_partitions.is_empty() {
         anyhow::bail!("systemd-repart returned empty partitions");
@@ -448,7 +448,7 @@ fn systemd_repart(
         } else {
             RepartDefinitions::Image
         };
-        let partitions = systemd_repart_run(device, generic_image, false, definitions)?;
+        let partitions = systemd_repart_run(&device.path(), generic_image, false, definitions)?;
         let layout = parse_repart_layout(&partitions)?;
         return Ok(layout);
     }
@@ -476,7 +476,7 @@ fn systemd_repart(
     let boot_partition_sizes = if generic_image && root_size.is_none() {
         write_repart_file(generated.path(), &root_name, &root_conf)?;
         let planned = systemd_repart_run(
-            device,
+            &device.path(),
             false,
             true,
             RepartDefinitions::WithGenerated(generated.path()),
@@ -514,7 +514,7 @@ fn systemd_repart(
         write_repart_file(generated.path(), &dropin, &planned_size_pin(*size))?;
     }
 
-    let partitions = systemd_repart_run(device, generic_image, false, definitions)?;
+    let partitions = systemd_repart_run(&device.path(), generic_image, false, definitions)?;
     let layout = parse_repart_layout(&partitions)?;
 
     Ok(layout)
@@ -571,11 +571,12 @@ impl RepartDefinitions<'_> {
     }
 }
 
-/// Run systemd-repart on the device and return the parsed JSON output.
+/// Run systemd-repart on the device (or image file) and return the parsed
+/// JSON output.
 /// `dry_run`: if true, no changes are written to disk.
 /// `definitions`: which repart.d definitions to read.
 fn systemd_repart_run(
-    device: &Device,
+    device: &str,
     generic_image: bool,
     dry_run: bool,
     definitions: RepartDefinitions,
@@ -602,7 +603,7 @@ fn systemd_repart_run(
     ]);
 
     cmd.args(definitions.args(generic_image));
-    cmd.arg(device.path());
+    cmd.arg(device);
 
     let output = cmd.output().context("Failed to run systemd-repart")?;
 
@@ -741,7 +742,7 @@ fn image_repart_partitions(
     if !can_use_systemd_repart() {
         return Ok(Vec::new());
     }
-    let partitions = systemd_repart_run(device, false, true, RepartDefinitions::Image)?;
+    let partitions = systemd_repart_run(&device.path(), false, true, RepartDefinitions::Image)?;
     validate_repart_boot_layout(&partitions, layout)?;
     Ok(partitions)
 }
@@ -882,7 +883,7 @@ fn systemd_repart_aboot(
             .write_all(config.as_bytes())?;
     }
     let partitions = systemd_repart_run(
-        device,
+        &device.path(),
         false,
         false,
         RepartDefinitions::Only(definitions.path()),
@@ -982,6 +983,111 @@ fn sfdisk(
     })
 }
 
+/// Apply the `Format=` assignments in a repart.d definition or drop-in to
+/// `format`. The last assignment wins, and an empty one resets it.
+fn apply_repart_format(conf: &str, format: &mut Option<String>) {
+    let mut in_partition = false;
+    for line in conf.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_partition = line == "[Partition]";
+            continue;
+        }
+        if !in_partition {
+            continue;
+        }
+        if let Some(("Format", value)) = line.split_once('=').map(|(k, v)| (k.trim(), v.trim())) {
+            *format = (!value.is_empty()).then(|| value.to_owned());
+        }
+    }
+}
+
+/// The `Format=` of the repart.d definition `file`, as found in `config_dirs`
+/// (in descending priority), with its `<name>.d/*.conf` drop-ins applied.
+fn repart_definition_format(config_dirs: &[&Path], file: &str) -> Result<Option<String>> {
+    // Older version of systemd-repart does not provide the full path to the file
+    let path = if Path::new(file).is_absolute() {
+        PathBuf::from(file)
+    } else {
+        config_dirs
+            .iter()
+            .map(|d| d.join(file))
+            .find(|p| p.exists())
+            .ok_or_else(|| anyhow::anyhow!("Could not find repart.d definition {file}"))?
+    };
+    let name = path
+        .file_name()
+        .context("Missing repart.d definition filename")?;
+    let mut dropin_dir_name = name.to_owned();
+    dropin_dir_name.push(".d");
+
+    // A drop-in in a higher-priority directory masks a same-named one below
+    // it, and drop-ins apply in name order.
+    let mut dropins = std::collections::BTreeMap::new();
+    for dir in config_dirs {
+        let dropin_dir = dir.join(&dropin_dir_name);
+        let entries = match std::fs::read_dir(&dropin_dir) {
+            std::result::Result::Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("Reading {}", dropin_dir.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry.with_context(|| format!("Reading {}", dropin_dir.display()))?;
+            let name = entry.file_name();
+            if Path::new(&name).extension() == Some(OsStr::new("conf")) {
+                dropins.entry(name).or_insert_with(|| entry.path());
+            }
+        }
+    }
+
+    let mut format = None;
+    for path in std::iter::once(&path).chain(dropins.values()) {
+        let conf = std::fs::read_to_string(path)
+            .with_context(|| format!("Reading repart.d definition {}", path.display()))?;
+        apply_repart_format(&conf, &mut format);
+    }
+    Ok(format)
+}
+
+/// The root filesystem that systemd-repart creates from the dry-run
+/// `partitions` of the image's definitions: that of the image's root
+/// definition, or `rootfs` for the one we generate when it has none. None if
+/// it is not one we know.
+fn repart_root_filesystem(
+    partitions: &[RepartPartition],
+    rootfs: Option<Filesystem>,
+) -> Result<Option<Filesystem>> {
+    let Some(root) = partitions
+        .iter()
+        .find(|p| p.partition_type.starts_with("root-"))
+    else {
+        return Ok(rootfs);
+    };
+    let dirs = REPART_CONFIG_DIRS.iter().map(Path::new).collect::<Vec<_>>();
+    let format = repart_definition_format(&dirs, &root.file)?;
+    Ok(format.and_then(|f| Filesystem::try_from(f.as_str()).ok()))
+}
+
+/// The root filesystem that `install to-disk --run-repart` creates on
+/// `device`, given `rootfs` from --filesystem or the install configuration
+/// for a root partition the image does not define. Unlike
+/// install_create_rootfs(), this works before a loopback device is set up
+/// for an image file.
+pub(crate) fn run_repart_root_filesystem(
+    device: &Utf8Path,
+    rootfs: Option<Filesystem>,
+) -> Result<Option<Filesystem>> {
+    if !can_use_systemd_repart() {
+        return Ok(rootfs);
+    }
+    let partitions = systemd_repart_run(device.as_str(), false, true, RepartDefinitions::Image)?;
+    repart_root_filesystem(&partitions, rootfs)
+}
+
 #[context("Creating rootfs")]
 #[cfg(feature = "install-to-disk")]
 pub(crate) fn install_create_rootfs(
@@ -993,14 +1099,6 @@ pub(crate) fn install_create_rootfs(
     let root_fs = opts.filesystem.or(install_config
         .and_then(|c| c.filesystem_root())
         .and_then(|r| r.fstype));
-    // A ZFS root is a dataset in a pool, which no mkfs creates. Reject it
-    // before modifying the target disk.
-    if root_fs == Some(Filesystem::Zfs) {
-        anyhow::bail!(
-            "zfs is not supported by `install to-disk`; \
-             create the filesystem by hand and use `install to-filesystem`"
-        );
-    }
     let luks_name = "root";
     // Verify that the target is empty (if not already wiped in particular, but it's
     // also good to verify that the wipe worked)
@@ -1011,6 +1109,17 @@ pub(crate) fn install_create_rootfs(
         anyhow::bail!("Device {} is mounted", device.path())
     }
 
+    if state.aboot_disk_layout.is_some() {
+        anyhow::ensure!(
+            has_systemd_repart(),
+            "aboot to-disk install requires systemd-repart"
+        );
+    }
+    let image_partitions = if state.aboot_disk_layout.is_some() || run_repart {
+        image_repart_partitions(&device, state.aboot_disk_layout)?
+    } else {
+        Vec::new()
+    };
     let use_systemd_repart =
         state.aboot_disk_layout.is_some() || (run_repart && can_use_systemd_repart());
 
@@ -1026,9 +1135,31 @@ pub(crate) fn install_create_rootfs(
         // and we need to error out.
         anyhow::bail!("No install configuration found, and no filesystem specified")
     };
+    // systemd-repart creates the root filesystem of the image's root
+    // definition, and /boot only for an XBOOTLDR definition, which a generic
+    // image's install leaves to first boot.
+    let (created_root_fs, separate_boot) = if use_systemd_repart {
+        let xbootldr = image_partitions
+            .iter()
+            .any(|p| p.partition_type == "xbootldr");
+        (
+            repart_root_filesystem(&image_partitions, root_fs)?,
+            xbootldr && !state.config_opts.generic_image,
+        )
+    } else {
+        (root_fs, block_setup.requires_bootpart())
+    };
+    // A ZFS root is a dataset in a pool, which neither mkfs nor
+    // systemd-repart creates. Reject it before modifying the target disk.
+    if created_root_fs == Some(Filesystem::Zfs) {
+        anyhow::bail!(
+            "zfs is not supported by `install to-disk`; \
+             create the filesystem by hand and use `install to-filesystem`"
+        );
+    }
     // A bcachefs root needs /boot on a partition of its own. Reject it
     // otherwise, before modifying the target disk.
-    if root_fs == Some(Filesystem::Bcachefs) && !block_setup.requires_bootpart() {
+    if created_root_fs == Some(Filesystem::Bcachefs) && !separate_boot {
         anyhow::bail!(
             "A bcachefs root requires a separate /boot partition with `install to-disk`; \
              create the filesystem by hand and use `install to-filesystem`"
@@ -1058,17 +1189,6 @@ pub(crate) fn install_create_rootfs(
         std::fs::remove_dir_all(&mntdir)?;
     }
 
-    if state.aboot_disk_layout.is_some() {
-        anyhow::ensure!(
-            has_systemd_repart(),
-            "aboot to-disk install requires systemd-repart"
-        );
-    }
-    let image_partitions = if state.aboot_disk_layout.is_some() || run_repart {
-        image_repart_partitions(&device, state.aboot_disk_layout)?
-    } else {
-        Vec::new()
-    };
     let serial = device.serial.as_deref().unwrap_or("<unknown>");
     let model = device.model.as_deref().unwrap_or("<unknown>");
     let discoverable = state.aboot_disk_layout.is_none() && use_discoverable_partitions(state);
@@ -1625,5 +1745,90 @@ mod tests {
                 "{definitions:?}, generic image: {generic_image}"
             );
         }
+    }
+
+    #[test]
+    fn test_apply_repart_format() {
+        let cases = [
+            ("[Partition]\nType=root\nFormat=xfs\n", Some("xfs")),
+            ("[Partition]\nType=root\n", None),
+            // Last assignment wins, and an empty one resets
+            (
+                "[Partition]\nFormat=xfs\nFormat = bcachefs\n",
+                Some("bcachefs"),
+            ),
+            ("[Partition]\nFormat=xfs\nFormat=\n", None),
+            // Comments and other sections do not count
+            ("[Partition]\n# Format=xfs\n; Format=ext4\n", None),
+            ("[Other]\nFormat=xfs\n[Partition]\nType=root\n", None),
+        ];
+        for (conf, expected) in cases {
+            let mut format = None;
+            apply_repart_format(conf, &mut format);
+            assert_eq!(format.as_deref(), expected, "{conf:?}");
+        }
+        // A drop-in without Format= keeps that of the definition
+        let mut format = Some("xfs".to_owned());
+        apply_repart_format("[Partition]\nSizeMinBytes=1G\n", &mut format);
+        assert_eq!(format.as_deref(), Some("xfs"));
+    }
+
+    #[test]
+    fn test_repart_definition_format() -> Result<()> {
+        let td = tempfile::tempdir()?;
+        let high = td.path().join("etc");
+        let low = td.path().join("usr");
+        let write = |dir: &Path, name: &str, conf: &str| -> Result<()> {
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(path, conf)?;
+            Ok(())
+        };
+        write(&low, "20-root.conf", "[Partition]\nType=root\nFormat=xfs\n")?;
+        let dirs = [high.as_path(), low.as_path()];
+        let file = low.join("20-root.conf");
+        let file = file.to_str().unwrap();
+        assert_eq!(
+            repart_definition_format(&dirs, file)?.as_deref(),
+            Some("xfs")
+        );
+        // Older systemd-repart reports only the file name
+        assert_eq!(
+            repart_definition_format(&dirs, "20-root.conf")?.as_deref(),
+            Some("xfs")
+        );
+
+        // Drop-ins apply in name order across directories
+        write(
+            &low,
+            "20-root.conf.d/10-fs.conf",
+            "[Partition]\nFormat=bcachefs\n",
+        )?;
+        write(
+            &low,
+            "20-root.conf.d/20-size.conf",
+            "[Partition]\nSizeMinBytes=1G\n",
+        )?;
+        write(&low, "20-root.conf.d/README", "[Partition]\nFormat=ext4\n")?;
+        assert_eq!(
+            repart_definition_format(&dirs, file)?.as_deref(),
+            Some("bcachefs")
+        );
+        write(
+            &high,
+            "20-root.conf.d/30-fs.conf",
+            "[Partition]\nFormat=btrfs\n",
+        )?;
+        assert_eq!(
+            repart_definition_format(&dirs, file)?.as_deref(),
+            Some("btrfs")
+        );
+        // A drop-in in a higher-priority directory masks a same-named one
+        write(&high, "20-root.conf.d/30-fs.conf", "")?;
+        write(&high, "20-root.conf.d/10-fs.conf", "[Partition]\nFormat=\n")?;
+        assert_eq!(repart_definition_format(&dirs, file)?, None);
+
+        assert!(repart_definition_format(&dirs, "missing.conf").is_err());
+        Ok(())
     }
 }
